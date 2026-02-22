@@ -1,5 +1,5 @@
 # CS2 Server Blocker
-CS2 Server Blocker.
+A quick vibecoded CS2 Server Blocker project.
 
 Pretty straight forward.
 Download the latest release from here https://github.com/fpsheaven/cs2serverblocker/releases
