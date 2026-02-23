@@ -1,0 +1,6 @@
+/target
+/.build_cache
+/.target_tmp*
+/.claude/settings.local.json
+*.zip
+*.lnk
