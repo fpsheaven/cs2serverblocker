@@ -1,6 +1,6 @@
-/// World land mass data as a 72x36 grid (5° per cell).
-/// col = (lon + 180) / 5, row = (90 - lat) / 5
-/// Land defined as column ranges per row.
+//! World land mass data as a 72x36 grid (5 degrees per cell).
+//! col = (lon + 180) / 5, row = (90 - lat) / 5
+//! Land is defined as column ranges per row.
 
 pub const GRID_COLS: usize = 72;
 pub const GRID_ROWS: usize = 36;
@@ -10,63 +10,63 @@ pub type LandGrid = [[bool; GRID_COLS]; GRID_ROWS];
 pub fn generate_land_grid() -> LandGrid {
     // Each row: list of (start_col_inclusive, end_col_inclusive) ranges
     let ranges: [&[(usize, usize)]; GRID_ROWS] = [
-        // Row 0  (90-85°N)
+        // Row 0  (90-85N)
         &[],
-        // Row 1  (85-80°N): Arctic Canada islands, northern Greenland
+        // Row 1  (85-80N): Arctic Canada islands, northern Greenland
         &[(14, 18), (24, 30)],
-        // Row 2  (80-75°N): Canadian Arctic, Greenland, northern Siberian coast
+        // Row 2  (80-75N): Canadian Arctic, Greenland, northern Siberian coast
         &[(10, 20), (22, 32), (52, 66)],
-        // Row 3  (75-70°N): Alaska, Canada, Greenland, Svalbard, Russia
+        // Row 3  (75-70N): Alaska, Canada, Greenland, Svalbard, Russia
         &[(2, 4), (9, 22), (23, 32), (37, 38), (42, 68)],
-        // Row 4  (70-65°N): Alaska, Canada, Greenland, Iceland, Scandinavia, Russia
+        // Row 4  (70-65N): Alaska, Canada, Greenland, Iceland, Scandinavia, Russia
         &[(1, 5), (8, 24), (25, 30), (31, 33), (37, 41), (43, 70)],
-        // Row 5  (65-60°N): Alaska, Canada, S. Greenland, UK north, Scandinavia, Russia
+        // Row 5  (65-60N): Alaska, Canada, S. Greenland, UK north, Scandinavia, Russia
         &[(1, 6), (8, 24), (35, 36), (37, 42), (44, 71)],
-        // Row 6  (60-55°N): S. Alaska, Canada, UK, Europe, Russia/Siberia
+        // Row 6  (60-55N): S. Alaska, Canada, UK, Europe, Russia/Siberia
         &[(2, 6), (9, 24), (34, 36), (37, 42), (43, 71)],
-        // Row 7  (55-50°N): Kamchatka tip, Canada, UK+France, Eur, Russia
+        // Row 7  (55-50N): Kamchatka tip, Canada, UK+France, Eur, Russia
         &[(10, 23), (34, 42), (43, 71)],
-        // Row 8  (50-45°N): S. Canada + N. USA, W+C Europe, Russia/Central Asia
+        // Row 8  (50-45N): S. Canada + N. USA, W+C Europe, Russia/Central Asia
         &[(12, 23), (34, 42), (43, 66)],
-        // Row 9  (45-40°N): USA, S. Europe, Central Asia / China
+        // Row 9  (45-40N): USA, S. Europe, Central Asia / China
         &[(13, 22), (34, 41), (42, 65)],
-        // Row 10 (40-35°N): USA, Iberia-Med-Turkey, Iran to China, Japan
+        // Row 10 (40-35N): USA, Iberia-Med-Turkey, Iran to China, Japan
         &[(13, 21), (34, 40), (41, 62), (63, 65)],
-        // Row 11 (35-30°N): S. USA, N. Africa coast, Middle East, India north, China, Japan
+        // Row 11 (35-30N): S. USA, N. Africa coast, Middle East, India north, China, Japan
         &[(14, 20), (34, 38), (40, 62), (63, 65)],
-        // Row 12 (30-25°N): Mexico, Sahara + Arabia, India, S. China
+        // Row 12 (30-25N): Mexico, Sahara + Arabia, India, S. China
         &[(15, 19), (33, 50), (51, 56), (57, 63)],
-        // Row 13 (25-20°N): Mexico + Caribbean, Sahara, Arabia, India, SE Asia
+        // Row 13 (25-20N): Mexico + Caribbean, Sahara, Arabia, India, SE Asia
         &[(15, 18), (32, 49), (50, 56), (57, 61)],
-        // Row 14 (20-15°N): C. America, W. Africa + Sahel, India, Indochina, Philippines
+        // Row 14 (20-15N): C. America, W. Africa + Sahel, India, Indochina, Philippines
         &[(15, 17), (32, 47), (50, 55), (56, 60)],
-        // Row 15 (15-10°N): C. America tip, W+C Africa, India, SE Asia
+        // Row 15 (15-10N): C. America tip, W+C Africa, India, SE Asia
         &[(15, 16), (32, 46), (51, 54), (57, 59)],
-        // Row 16 (10-5°N): N. South America, Guinea coast, Indochina/Malaysia
+        // Row 16 (10-5N): N. South America, Guinea coast, Indochina/Malaysia
         &[(16, 17), (32, 45), (57, 59)],
-        // Row 17 (5°N-0°): N. Brazil/Guyana, Congo, Malaysia, Borneo, Sulawesi-Papua
+        // Row 17 (5N-0): N. Brazil/Guyana, Congo, Malaysia, Borneo, Sulawesi-Papua
         &[(17, 21), (33, 44), (55, 58), (60, 63)],
-        // Row 18 (0-5°S): Brazil, E. Africa, Sumatra, Borneo+Papua
+        // Row 18 (0-5S): Brazil, E. Africa, Sumatra, Borneo+Papua
         &[(17, 24), (35, 44), (55, 57), (59, 64)],
-        // Row 19 (5-10°S): Brazil wide, E. Africa, Java, Papua
+        // Row 19 (5-10S): Brazil wide, E. Africa, Java, Papua
         &[(18, 27), (37, 44), (55, 56), (60, 65)],
-        // Row 20 (10-15°S): Brazil widest, E. Africa, Madagascar, N. Australia
+        // Row 20 (10-15S): Brazil widest, E. Africa, Madagascar, N. Australia
         &[(18, 28), (38, 44), (45, 46), (61, 66)],
-        // Row 21 (15-20°S): Brazil, SE Africa, Madagascar, Australia
+        // Row 21 (15-20S): Brazil, SE Africa, Madagascar, Australia
         &[(18, 27), (39, 44), (45, 46), (59, 67)],
-        // Row 22 (20-25°S): Brazil, S. Africa, Madagascar, Australia
+        // Row 22 (20-25S): Brazil, S. Africa, Madagascar, Australia
         &[(18, 26), (39, 43), (45, 46), (59, 68)],
-        // Row 23 (25-30°S): S. Brazil + Paraguay, S. Africa, Australia
+        // Row 23 (25-30S): S. Brazil + Paraguay, S. Africa, Australia
         &[(19, 25), (39, 43), (59, 68)],
-        // Row 24 (30-35°S): Argentina/Chile, S. Africa tip, Australia
+        // Row 24 (30-35S): Argentina/Chile, S. Africa tip, Australia
         &[(19, 24), (39, 42), (60, 68)],
-        // Row 25 (35-40°S): Argentina, SE Australia, New Zealand
+        // Row 25 (35-40S): Argentina, SE Australia, New Zealand
         &[(20, 23), (62, 67), (69, 71)],
-        // Row 26 (40-45°S): Patagonia, Tasmania, New Zealand
+        // Row 26 (40-45S): Patagonia, Tasmania, New Zealand
         &[(20, 22), (65, 66), (70, 71)],
-        // Row 27 (45-50°S): S. Patagonia, NZ south
+        // Row 27 (45-50S): S. Patagonia, NZ south
         &[(20, 21), (70, 71)],
-        // Row 28 (50-55°S): Tierra del Fuego
+        // Row 28 (50-55S): Tierra del Fuego
         &[(20, 21)],
         // Rows 29-35: Southern Ocean
         &[],
@@ -81,8 +81,12 @@ pub fn generate_land_grid() -> LandGrid {
     let mut grid = [[false; GRID_COLS]; GRID_ROWS];
     for (r, row_ranges) in ranges.iter().enumerate() {
         for &(start, end) in *row_ranges {
-            for c in start..=end.min(GRID_COLS - 1) {
-                grid[r][c] = true;
+            for cell in grid[r]
+                .iter_mut()
+                .take(end.min(GRID_COLS - 1) + 1)
+                .skip(start)
+            {
+                *cell = true;
             }
         }
     }
@@ -201,7 +205,7 @@ pub fn classify_region(lon: f64, lat: f64, desc: &str) -> Region {
     }
 
     // Europe
-    if lat > 35.0 && lon >= -15.0 && lon < 40.0 {
+    if lat > 35.0 && (-15.0..40.0).contains(&lon) {
         if lon < 20.0 {
             return Region::EuWest;
         }
