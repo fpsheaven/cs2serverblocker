@@ -153,50 +153,8 @@ For each blocked server, 4 rules are created:
 
 All relay IPs for a server are combined into a single `remoteip` parameter, and port ranges are merged to cover the widest range.
 
----
-
-## Development Checks
-
-Before pushing a change, run:
-
-```powershell
-cargo fmt
-cargo check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --release
-```
 
 ---
-
-## Project Structure
-
-```text
-src/
-  main.rs       - Entry point, window setup, icon loading
-  app.rs        - Main application UI and logic
-  api.rs        - Steam SDR API client
-  firewall.rs   - Windows Firewall rule management
-  map.rs        - Interactive world map rendering
-  world_data.rs - Land mass data for map display
-assets/
-  banner.png    - README banner
-  icon.png      - Application icon
-  icon.ico      - Windows executable icon
-build.rs        - Windows resource embedding
-```
-
----
-
-## Tech Stack
-
-- **[Rust](https://www.rust-lang.org/)** - Systems programming language
-- **[eframe](https://github.com/emilk/egui/tree/master/crates/eframe) / [egui](https://github.com/emilk/egui)** - Immediate mode GUI framework
-- **[reqwest](https://github.com/seanmonstar/reqwest)** - HTTP client for Steam API
-- **[serde](https://serde.rs/)** - JSON deserialization
-- **[image](https://github.com/image-rs/image)** - PNG icon loading
-- **[winres](https://github.com/mxre/winres)** - Windows executable resource embedding
-
 ---
 
 ## FAQ
