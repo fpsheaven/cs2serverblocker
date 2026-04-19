@@ -5,6 +5,7 @@ use crate::api::ServerLocation;
 
 const RULE_PREFIX: &str = "CS2_Block";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const POWERSHELL_COMMAND_BUDGET: usize = 24_000;
 
 fn hidden_command(program: &str) -> Command {
     let mut cmd = Command::new(program);
@@ -104,60 +105,132 @@ fn list_rule_names() -> Result<HashSet<String>, String> {
     list_rule_names_via_powershell().or_else(|_| list_rule_names_via_netsh())
 }
 
-/// Run a batch of netsh commands in a single PowerShell invocation.
-/// Falls back to individual netsh calls if PowerShell fails to launch.
-fn run_netsh_batch(commands: &[Vec<String>]) -> Result<(), String> {
+enum PowerShellRunError {
+    Launch(String),
+    Failed(String),
+}
+
+fn powershell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "''"))
+}
+
+fn netsh_script_line(index: usize, args: &[String]) -> String {
+    let args_str = args
+        .iter()
+        .map(|a| powershell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "$r = & netsh {}\nif ($LASTEXITCODE -ne 0) {{ $failed += '#{}: ' + ($r -join ' ') }}\n",
+        args_str, index
+    )
+}
+
+fn build_powershell_script(commands: &[Vec<String>]) -> String {
+    let mut script = String::from("$ErrorActionPreference='Stop'\n$failed=@()\n");
+    for (i, args) in commands.iter().enumerate() {
+        script.push_str(&netsh_script_line(i, args));
+    }
+    script.push_str("if ($failed.Count -gt 0) { Write-Error ($failed -join \"`n\"); exit 1 }\n");
+    script
+}
+
+fn run_powershell_script(script: &str) -> Result<(), PowerShellRunError> {
+    let out = hidden_command("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .map_err(|e| PowerShellRunError::Launch(e.to_string()))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let details = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        Err(PowerShellRunError::Failed(format!(
+            "Batch firewall operation failed: {}",
+            details
+        )))
+    }
+}
+
+fn run_netsh_command(args: &[String]) -> Result<(), String> {
+    let out = hidden_command("netsh")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run netsh: {}", e))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let details = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        Err(format!("netsh failed: {}", details))
+    }
+}
+
+fn run_netsh_chunk(commands: &[Vec<String>]) -> Result<(), String> {
     if commands.is_empty() {
         return Ok(());
     }
 
-    // Build a PowerShell script that runs all netsh commands and collects errors.
-    let mut script = String::from("$ErrorActionPreference='Stop'\n$failed=@()\n");
-    for (i, args) in commands.iter().enumerate() {
-        let args_str = args
-            .iter()
-            .map(|a| format!("'{}'", a.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        script.push_str(&format!(
-            "$r = & netsh {}\nif ($LASTEXITCODE -ne 0) {{ $failed += '#{}: ' + ($r -join ' ') }}\n",
-            args_str, i
-        ));
-    }
-    script.push_str("if ($failed.Count -gt 0) { Write-Error ($failed -join \"`n\"); exit 1 }\n");
-
-    let out = hidden_command("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output();
-
-    match out {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("Batch firewall operation failed: {}", stderr.trim()));
-            }
-            Ok(())
-        }
-        Err(_) => {
-            // Fallback: run each netsh command individually
+    let script = build_powershell_script(commands);
+    match run_powershell_script(&script) {
+        Ok(()) => Ok(()),
+        Err(PowerShellRunError::Failed(err)) => Err(err),
+        Err(PowerShellRunError::Launch(err)) => {
             for args in commands {
-                let out = hidden_command("netsh")
-                    .args(args)
-                    .output()
-                    .map_err(|e| format!("Failed to run netsh: {}", e))?;
-                if !out.status.success() {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    return Err(format!("netsh failed: {}", stderr.trim()));
-                }
+                run_netsh_command(args).map_err(|netsh_err| {
+                    format!("PowerShell launch failed ({}); fallback {}", err, netsh_err)
+                })?;
             }
             Ok(())
         }
     }
 }
 
-/// Block multiple server locations in a single PowerShell invocation.
+/// Run netsh commands through bounded PowerShell batches.
+fn run_netsh_batch(commands: &[Vec<String>]) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+
+    let base_len = "$ErrorActionPreference='Stop'\n$failed=@()\n".len()
+        + "if ($failed.Count -gt 0) { Write-Error ($failed -join \"`n\"); exit 1 }\n".len();
+    let mut chunk: Vec<Vec<String>> = Vec::new();
+    let mut chunk_len = base_len;
+
+    for args in commands {
+        let line_len = netsh_script_line(chunk.len(), args).len();
+        if !chunk.is_empty() && chunk_len + line_len > POWERSHELL_COMMAND_BUDGET {
+            run_netsh_chunk(&chunk)?;
+            chunk.clear();
+            chunk_len = base_len;
+        }
+
+        if chunk_len + line_len > POWERSHELL_COMMAND_BUDGET {
+            run_netsh_command(args)?;
+        } else {
+            chunk.push(args.clone());
+            chunk_len += line_len;
+        }
+    }
+
+    run_netsh_chunk(&chunk)
+}
+
+/// Block multiple server locations.
 /// Combines all relay IPs per server into one rule, creating only 4 rules per server
-/// (in/out × tcp/udp) regardless of relay count.
+/// (in/out x tcp/udp) regardless of relay count.
 pub fn block_servers(locations: &[ServerLocation]) -> Result<(), String> {
     if locations.is_empty() {
         return Ok(());
@@ -212,7 +285,7 @@ pub fn block_servers(locations: &[ServerLocation]) -> Result<(), String> {
     run_netsh_batch(&commands)
 }
 
-/// Unblock multiple server locations in a single PowerShell invocation.
+/// Unblock multiple server locations.
 /// Handles both old (per-IP) and new (combined) rule formats.
 pub fn unblock_servers(locations: &[ServerLocation]) -> Result<(), String> {
     if locations.is_empty() {
@@ -252,19 +325,18 @@ pub fn unblock_servers(locations: &[ServerLocation]) -> Result<(), String> {
     run_netsh_batch(&commands)
 }
 
-/// Get set of server codes that currently have firewall block rules
-pub fn get_blocked_servers() -> HashSet<String> {
+/// Get set of server codes that currently have firewall block rules.
+pub fn get_blocked_servers() -> Result<HashSet<String>, String> {
     let mut blocked = HashSet::new();
 
-    if let Ok(rule_names) = list_rule_names() {
-        for name in rule_names {
-            if let Some(code) = server_code_from_rule_name(&name) {
-                blocked.insert(code);
-            }
+    let rule_names = list_rule_names()?;
+    for name in rule_names {
+        if let Some(code) = server_code_from_rule_name(&name) {
+            blocked.insert(code);
         }
     }
 
-    blocked
+    Ok(blocked)
 }
 
 /// Check if running with administrator privileges
@@ -299,12 +371,39 @@ pub fn relaunch_as_admin() -> Result<(), String> {
         if status.success() {
             std::process::exit(0);
         } else {
-            return Err("User declined elevation".to_string());
+            Err("User declined elevation".to_string())
         }
     }
 
     #[cfg(not(windows))]
     {
         Err("Administrator elevation only supported on Windows".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_new_rule_names() {
+        assert_eq!(
+            server_code_from_rule_name("CS2_Block_fra"),
+            Some("fra".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_old_per_ip_rule_names() {
+        assert_eq!(
+            server_code_from_rule_name("CS2_Block_sto2_155_133_252_37"),
+            Some("sto2".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_rule_names() {
+        assert_eq!(server_code_from_rule_name("OtherRule_fra"), None);
+        assert_eq!(server_code_from_rule_name("CS2_Block_"), None);
     }
 }

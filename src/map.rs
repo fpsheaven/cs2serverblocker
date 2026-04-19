@@ -87,7 +87,7 @@ pub fn draw_map(painter: &Painter, map_rect: Rect, state: &MapState) {
             let (lon, lat) = screen_to_geo(Pos2::new(x, y), map_rect, state);
 
             // Skip out-of-bounds coordinates
-            if lon >= -180.0 && lon <= 180.0 && lat >= -90.0 && lat <= 90.0 {
+            if (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat) {
                 let val = world_data::land_value(&state.land_grid, lon, lat);
                 if val > 0.3 {
                     let alpha = (val * 0.8).min(1.0);
@@ -130,7 +130,6 @@ pub fn draw_region_labels(
     state: &MapState,
     stats: &HashMap<Region, (usize, usize)>,
 ) {
-
     for &region in Region::all() {
         let (total, blocked_count) = stats.get(&region).copied().unwrap_or((0, 0));
         if total == 0 {

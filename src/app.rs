@@ -11,6 +11,8 @@ use crate::world_data::Region;
 
 type ServerLoadResult = Result<Vec<ServerLocation>, String>;
 type BlockedLoadResult = Result<HashSet<String>, String>;
+type RegionStats = HashMap<Region, (usize, usize)>;
+type CachedRegionStats = (u64, RegionStats);
 
 #[derive(Default, Clone)]
 struct CountryStat {
@@ -30,6 +32,15 @@ struct CachedCountryPanel {
     unblocked_count: usize,
 }
 
+struct CountryRow<'a> {
+    country: &'a str,
+    row_text: String,
+    row_color: Color32,
+    should_block: bool,
+    rule_summary: Option<(String, Color32)>,
+    rule_enabled: bool,
+}
+
 struct CountryActionOutcome {
     country: String,
     should_block: bool,
@@ -46,21 +57,19 @@ struct CountryActionPending {
     should_block: bool,
 }
 
-struct PingVerificationWorkerResult {
+struct RuleVerificationWorkerResult {
     code: String,
-    blocked: bool,
-    checked_relays: usize,
-    reachable_relays: usize,
+    expected_blocked: bool,
+    actual_blocked: bool,
 }
 
-struct PingVerificationOutcome {
-    results: Vec<PingVerificationWorkerResult>,
+struct RuleVerificationOutcome {
+    result: Result<Vec<RuleVerificationWorkerResult>, String>,
 }
 
-struct PingVerificationResult {
-    blocked: bool,
-    checked_relays: usize,
-    reachable_relays: usize,
+struct RuleVerificationResult {
+    expected_blocked: bool,
+    actual_blocked: bool,
     _checked_at: f64,
 }
 
@@ -105,10 +114,10 @@ pub struct App {
     blocked_state_version: u64,
     country_action_rx: Option<Receiver<CountryActionOutcome>>,
     country_action_pending: Option<CountryActionPending>,
-    ping_results: HashMap<String, PingVerificationResult>,
-    ping_rx: Option<Receiver<PingVerificationOutcome>>,
+    rule_results: HashMap<String, RuleVerificationResult>,
+    rule_rx: Option<Receiver<RuleVerificationOutcome>>,
     cached_panel: Option<CachedCountryPanel>,
-    cached_region_stats: Option<(u64, HashMap<Region, (usize, usize)>)>,
+    cached_region_stats: Option<CachedRegionStats>,
     selected_countries: HashSet<String>,
     except_selections: HashMap<String, usize>,
     /// Countries whose individual server list is expanded in the side panel.
@@ -137,8 +146,8 @@ impl App {
             blocked_state_version: 0,
             country_action_rx: None,
             country_action_pending: None,
-            ping_results: HashMap::new(),
-            ping_rx: None,
+            rule_results: HashMap::new(),
+            rule_rx: None,
             cached_panel: None,
             cached_region_stats: None,
             selected_countries: HashSet::new(),
@@ -154,11 +163,13 @@ impl App {
     fn start_loading(&mut self) {
         self.loading = true;
         self.error = None;
-        self.ping_results.clear();
+        self.rule_results.clear();
         self.blocked.clear();
         self.blocked_state_version = 0;
         self.blocked_sync_in_progress = false;
         self.blocked_sync_rx = None;
+        self.cached_panel = None;
+        self.cached_region_stats = None;
 
         let (tx, rx) = mpsc::channel::<ServerLoadResult>();
 
@@ -184,12 +195,14 @@ impl App {
                 self.error = None;
                 self.loading = false;
                 self.load_rx = None;
-                self.ping_results.clear();
+                self.rule_results.clear();
+                self.cached_panel = None;
+                self.cached_region_stats = None;
                 self.update_search();
                 self.set_status(format!("Loaded {} servers", self.servers.len()), ctx);
 
                 if self.is_admin {
-                    self.start_blocked_sync(ctx);
+                    self.start_blocked_sync(ctx, "Loaded servers. Syncing firewall rule status...");
                 }
             }
             Ok(Err(err)) => {
@@ -211,7 +224,7 @@ impl App {
         }
     }
 
-    fn start_blocked_sync(&mut self, ctx: &egui::Context) {
+    fn start_blocked_sync(&mut self, ctx: &egui::Context, status: impl Into<String>) {
         if !self.is_admin || self.blocked_sync_in_progress {
             return;
         }
@@ -223,13 +236,13 @@ impl App {
             let blocked = firewall::get_blocked_servers();
             let _ = tx.send(BlockedSyncOutcome {
                 version,
-                result: Ok(blocked),
+                result: blocked,
             });
         });
 
         self.blocked_sync_rx = Some(rx);
         self.blocked_sync_in_progress = true;
-        self.set_status("Loaded servers. Syncing firewall rule status...", ctx);
+        self.set_status(status, ctx);
     }
 
     fn poll_blocked_sync(&mut self, ctx: &egui::Context) {
@@ -283,7 +296,7 @@ impl App {
             Ok(outcome) => {
                 let changed_count = outcome.changed_codes.len() + outcome.unblocked_codes.len();
                 for code in outcome.changed_codes {
-                    self.ping_results.remove(&code);
+                    self.rule_results.remove(&code);
                     if outcome.should_block {
                         self.blocked.insert(code);
                     } else {
@@ -291,7 +304,7 @@ impl App {
                     }
                 }
                 for code in outcome.unblocked_codes {
-                    self.ping_results.remove(&code);
+                    self.rule_results.remove(&code);
                     self.blocked.remove(&code);
                 }
                 if changed_count > 0 {
@@ -303,33 +316,35 @@ impl App {
                 } else {
                     "Unblocked"
                 };
-                if outcome.failed > 0 {
+                let operation_status = if outcome.failed > 0 {
                     let reason = outcome
                         .first_error
                         .unwrap_or_else(|| "unknown error".to_string());
-                    self.set_status(
-                        format!(
-                            "{} {}: {} changed, {} skipped, {} failed ({})",
-                            action,
-                            outcome.country,
-                            changed_count,
-                            outcome.skipped,
-                            outcome.failed,
-                            reason
-                        ),
-                        ctx,
-                    );
+                    format!(
+                        "{} {}: {} changed, {} skipped, {} failed ({})",
+                        action,
+                        outcome.country,
+                        changed_count,
+                        outcome.skipped,
+                        outcome.failed,
+                        reason
+                    )
                 } else {
-                    self.set_status(
-                        format!(
-                            "{} {} complete: {} changed, {} skipped",
-                            action, outcome.country, changed_count, outcome.skipped
-                        ),
-                        ctx,
-                    );
-                }
+                    format!(
+                        "{} {} complete: {} changed, {} skipped",
+                        action, outcome.country, changed_count, outcome.skipped
+                    )
+                };
                 self.country_action_rx = None;
                 self.country_action_pending = None;
+                if self.is_admin {
+                    self.start_blocked_sync(
+                        ctx,
+                        format!("{}; refreshing firewall state...", operation_status),
+                    );
+                } else {
+                    self.set_status(operation_status, ctx);
+                }
             }
             Err(TryRecvError::Empty) => {
                 ctx.request_repaint();
@@ -342,8 +357,8 @@ impl App {
         }
     }
 
-    fn poll_ping_verification(&mut self, ctx: &egui::Context) {
-        let recv_result = match self.ping_rx.as_ref() {
+    fn poll_rule_verification(&mut self, ctx: &egui::Context) {
+        let recv_result = match self.rule_rx.as_ref() {
             Some(rx) => rx.try_recv(),
             None => return,
         };
@@ -351,128 +366,99 @@ impl App {
         match recv_result {
             Ok(outcome) => {
                 let checked_at = ctx.input(|i| i.time);
-                let count = outcome.results.len();
-                for result in outcome.results {
-                    self.ping_results.insert(
-                        result.code.clone(),
-                        PingVerificationResult {
-                            blocked: result.blocked,
-                            checked_relays: result.checked_relays,
-                            reachable_relays: result.reachable_relays,
-                            _checked_at: checked_at,
-                        },
-                    );
+                match outcome.result {
+                    Ok(results) => {
+                        let count = results.len();
+                        for result in results {
+                            self.rule_results.insert(
+                                result.code.clone(),
+                                RuleVerificationResult {
+                                    expected_blocked: result.expected_blocked,
+                                    actual_blocked: result.actual_blocked,
+                                    _checked_at: checked_at,
+                                },
+                            );
+                        }
+                        self.set_status(
+                            format!(
+                                "Firewall rule verification complete for {} server(s)",
+                                count
+                            ),
+                            ctx,
+                        );
+                    }
+                    Err(err) => {
+                        self.set_status(format!("Firewall rule verification failed: {}", err), ctx);
+                    }
                 }
-                self.ping_rx = None;
-                self.set_status(
-                    format!("Ping verification complete for {} server(s)", count),
-                    ctx,
-                );
+                self.rule_rx = None;
             }
             Err(TryRecvError::Empty) => {
                 ctx.request_repaint();
             }
             Err(TryRecvError::Disconnected) => {
-                self.ping_rx = None;
-                self.set_status("Ping verification worker stopped unexpectedly", ctx);
+                self.rule_rx = None;
+                self.set_status(
+                    "Firewall rule verification worker stopped unexpectedly",
+                    ctx,
+                );
             }
         }
     }
 
-    fn start_ping_verification(&mut self, indices: Vec<usize>, ctx: &egui::Context) {
-        if self.ping_rx.is_some() {
-            self.set_status("Ping verification already running", ctx);
+    fn start_rule_verification(&mut self, indices: Vec<usize>, ctx: &egui::Context) {
+        if self.rule_rx.is_some() {
+            self.set_status("Firewall rule verification already running", ctx);
             return;
         }
 
         let mut targets = Vec::new();
         for idx in indices {
-            if idx >= self.servers.len() {
-                continue;
+            if let Some(server) = self.servers.get(idx) {
+                targets.push((server.code.clone(), self.blocked.contains(&server.code)));
             }
-            let server = &self.servers[idx];
-            let relay_ips = server
-                .relays
-                .iter()
-                .map(|relay| relay.ipv4.clone())
-                .collect::<Vec<_>>();
-            targets.push((
-                server.code.clone(),
-                self.blocked.contains(&server.code),
-                relay_ips,
-            ));
         }
 
         if targets.is_empty() {
-            self.set_status("No servers selected for ping verification", ctx);
+            self.set_status("No servers selected for firewall rule verification", ctx);
             return;
         }
 
         self.set_status(
             format!(
-                "Running ping verification for {} server(s)...",
+                "Checking Windows Firewall rules for {} server(s)...",
                 targets.len()
             ),
             ctx,
         );
 
-        let (tx, rx) = mpsc::channel::<PingVerificationOutcome>();
-        self.ping_rx = Some(rx);
+        let (tx, rx) = mpsc::channel::<RuleVerificationOutcome>();
+        self.rule_rx = Some(rx);
 
         std::thread::spawn(move || {
-            // Ping all servers in parallel using scoped threads.
-            let results = std::thread::scope(|s| {
-                let handles: Vec<_> = targets
+            let result = firewall::get_blocked_servers().map(|blocked_codes| {
+                targets
                     .into_iter()
-                    .map(|(code, blocked, relay_ips)| {
-                        s.spawn(move || {
-                            let checked_relays = relay_ips.len().min(3);
-                            let mut reachable_relays = 0usize;
-
-                            for ip in relay_ips.iter().take(checked_relays) {
-                                if ping_host_once(ip) {
-                                    reachable_relays += 1;
-                                }
-                            }
-
-                            PingVerificationWorkerResult {
-                                code,
-                                blocked,
-                                checked_relays,
-                                reachable_relays,
-                            }
-                        })
+                    .map(|(code, expected_blocked)| RuleVerificationWorkerResult {
+                        actual_blocked: blocked_codes.contains(&code),
+                        expected_blocked,
+                        code,
                     })
-                    .collect();
-
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    .collect()
             });
 
-            let _ = tx.send(PingVerificationOutcome { results });
+            let _ = tx.send(RuleVerificationOutcome { result });
         });
     }
 
-    fn ping_status_for_server(&self, code: &str) -> Option<(String, Color32)> {
-        let result = self.ping_results.get(code)?;
+    fn rule_status_for_server(&self, code: &str) -> Option<(String, Color32)> {
+        let result = self.rule_results.get(code)?;
 
-        if result.blocked {
-            Some(("Server Unreachable. Block works".to_string(), GREEN))
-        } else if result.reachable_relays > 0 {
-            Some((
-                format!(
-                    "Reachable {}/{}",
-                    result.reachable_relays, result.checked_relays
-                ),
-                GREEN,
-            ))
-        } else {
-            Some((
-                format!(
-                    "Unreachable 0/{} (may block ICMP)",
-                    result.checked_relays
-                ),
-                YELLOW,
-            ))
+        match (result.expected_blocked, result.actual_blocked) {
+            (true, true) => Some(("Rules OK: blocked".to_string(), GREEN)),
+            (false, false) => Some(("Rules OK: active".to_string(), GREEN)),
+            (true, false) => Some(("Rules missing".to_string(), RED)),
+            (false, true) => Some(("Unexpected block rule".to_string(), RED)),
         }
     }
 
@@ -484,52 +470,46 @@ impl App {
             .collect()
     }
 
-    fn country_ping_summary(&self, country: &str) -> Option<(String, Color32)> {
+    fn country_rule_summary(&self, country: &str) -> Option<(String, Color32)> {
         let mut ok = 0usize;
-        let mut warn = 0usize;
-        let mut any_blocked = false;
+        let mut mismatch = 0usize;
 
         for (idx, server) in self.servers.iter().enumerate() {
             if self.server_countries[idx] != country {
                 continue;
             }
-            let Some(result) = self.ping_results.get(&server.code) else {
+            let Some(result) = self.rule_results.get(&server.code) else {
                 continue;
             };
 
-            if result.blocked {
-                any_blocked = true;
-                ok += 1;
-            } else if result.reachable_relays > 0 {
+            if result.expected_blocked == result.actual_blocked {
                 ok += 1;
             } else {
-                warn += 1;
+                mismatch += 1;
             }
         }
 
-        let tested = ok + warn;
+        let tested = ok + mismatch;
         if tested == 0 {
             return None;
         }
 
-        if warn > 0 {
+        if mismatch > 0 {
             Some((
-                format!("{}/{} ok, {}/{} unreachable", ok, tested, warn, tested),
-                YELLOW,
+                format!("{}/{} rules ok, {} mismatch", ok, tested, mismatch),
+                RED,
             ))
-        } else if any_blocked {
-            Some(("Server Unreachable. Block works".to_string(), GREEN))
         } else {
-            Some((format!("{}/{} reachable", ok, tested), GREEN))
+            Some((format!("{}/{} rules ok", ok, tested), GREEN))
         }
     }
 
-    fn show_ping_running_indicator(&self, ui: &mut egui::Ui) {
-        if self.ping_rx.is_some() {
+    fn show_rule_running_indicator(&self, ui: &mut egui::Ui) {
+        if self.rule_rx.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
-                    RichText::new("Ping verification running...")
+                    RichText::new("Firewall rule verification running...")
                         .color(YELLOW)
                         .small(),
                 );
@@ -540,46 +520,44 @@ impl App {
     fn render_country_row(
         &self,
         ui: &mut egui::Ui,
-        country: &str,
-        row_text: String,
-        row_color: Color32,
-        should_block: bool,
+        row: CountryRow<'_>,
         country_action: &mut Option<(String, bool)>,
-        country_ping_action: &mut Option<String>,
+        country_rule_action: &mut Option<String>,
         selected: &mut HashSet<String>,
-        ping_summary: Option<(String, Color32)>,
-        ping_enabled: bool,
     ) {
         ui.horizontal(|ui| {
-            let mut is_selected = selected.contains(country);
+            let mut is_selected = selected.contains(row.country);
             let before = is_selected;
             ui.checkbox(&mut is_selected, "");
             if is_selected != before {
                 if is_selected {
-                    selected.insert(country.to_string());
+                    selected.insert(row.country.to_string());
                 } else {
-                    selected.remove(country);
+                    selected.remove(row.country);
                 }
             }
 
-            if ui.add(
-                egui::Label::new(RichText::new(row_text).color(row_color).small())
-                    .sense(egui::Sense::click()),
-            ).clicked() {
-                *country_action = Some((country.to_string(), should_block));
+            if ui
+                .add(
+                    egui::Label::new(RichText::new(row.row_text).color(row.row_color).small())
+                        .sense(egui::Sense::click()),
+                )
+                .clicked()
+            {
+                *country_action = Some((row.country.to_string(), row.should_block));
             }
 
             if ui
                 .add_enabled(
-                    ping_enabled,
-                    egui::Button::new(RichText::new("Ping").small()),
+                    row.rule_enabled,
+                    egui::Button::new(RichText::new("Rules").small()),
                 )
                 .clicked()
             {
-                *country_ping_action = Some(country.to_string());
+                *country_rule_action = Some(row.country.to_string());
             }
 
-            if let Some((summary_text, summary_color)) = ping_summary.as_ref() {
+            if let Some((summary_text, summary_color)) = row.rule_summary.as_ref() {
                 ui.label(
                     RichText::new(summary_text)
                         .color(*summary_color)
@@ -666,8 +644,13 @@ impl App {
             countries.sort_by(|a, b| {
                 let a_blocked = a.2 > 0;
                 let b_blocked = b.2 > 0;
-                b_blocked.cmp(&a_blocked)
-                    .then_with(|| if a_blocked && b_blocked { b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)) } else { a.0.cmp(&b.0) })
+                b_blocked.cmp(&a_blocked).then_with(|| {
+                    if a_blocked && b_blocked {
+                        b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0))
+                    } else {
+                        a.0.cmp(&b.0)
+                    }
+                })
             });
         }
 
@@ -698,6 +681,14 @@ impl App {
         target_servers: Vec<ServerLocation>,
         ctx: &egui::Context,
     ) {
+        if self.blocked_sync_in_progress {
+            self.set_status(
+                "Wait for firewall sync to finish before changing rules",
+                ctx,
+            );
+            return;
+        }
+
         if self.country_action_rx.is_some() {
             self.set_status("A block/unblock operation is already running", ctx);
             return;
@@ -739,17 +730,22 @@ impl App {
             should_block,
         });
 
+        let requested_count = target_servers.len();
         std::thread::spawn(move || {
             // Filter to only servers that actually need the action
             let servers_to_process: Vec<_> = target_servers
                 .into_iter()
                 .filter(|s| {
                     let currently_blocked = blocked_snapshot.contains(&s.code);
-                    if should_block { !currently_blocked } else { currently_blocked }
+                    if should_block {
+                        !currently_blocked
+                    } else {
+                        currently_blocked
+                    }
                 })
                 .collect();
 
-            let skipped = 0usize; // skipped servers were filtered out above
+            let skipped = requested_count.saturating_sub(servers_to_process.len());
             let total = servers_to_process.len();
 
             // Single batched firewall call for ALL servers at once
@@ -787,6 +783,14 @@ impl App {
         to_unblock: Vec<ServerLocation>,
         ctx: &egui::Context,
     ) {
+        if self.blocked_sync_in_progress {
+            self.set_status(
+                "Wait for firewall sync to finish before changing rules",
+                ctx,
+            );
+            return;
+        }
+
         if self.country_action_rx.is_some() {
             self.set_status("A block/unblock operation is already running", ctx);
             return;
@@ -818,6 +822,8 @@ impl App {
         });
 
         let blocked_snapshot = self.blocked.clone();
+        let requested_block = to_block.len();
+        let requested_unblock = to_unblock.len();
 
         std::thread::spawn(move || {
             let mut blocked_codes = Vec::new();
@@ -863,12 +869,15 @@ impl App {
                 }
             }
 
+            let skipped = requested_block.saturating_sub(servers_to_block.len())
+                + requested_unblock.saturating_sub(servers_to_unblock.len());
+
             let _ = tx.send(CountryActionOutcome {
                 country: scope_name,
                 should_block: true,
                 changed_codes: blocked_codes,
                 unblocked_codes,
-                skipped: 0,
+                skipped,
                 failed,
                 first_error,
             });
@@ -919,12 +928,12 @@ impl eframe::App for App {
         self.poll_loading(ctx);
         self.poll_blocked_sync(ctx);
         self.poll_country_action(ctx);
-        self.poll_ping_verification(ctx);
+        self.poll_rule_verification(ctx);
 
         let mut toggle_action: Option<usize> = None;
         let mut country_action: Option<(String, bool)> = None;
-        let continent_action: Option<(String, bool)> = None;
-        let mut country_ping_action: Option<String> = None;
+        let mut continent_action: Option<(String, bool)> = None;
+        let mut country_rule_action: Option<String> = None;
         let mut mass_block_action: Option<bool> = None;
         let mut unblock_all_action = false;
         let mut except_block_action: Option<(String, String)> = None;
@@ -942,7 +951,9 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         if ui
-                            .small_button(RichText::new("NOT ADMIN - Click to elevate").color(YELLOW))
+                            .small_button(
+                                RichText::new("NOT ADMIN - Click to elevate").color(YELLOW),
+                            )
                             .clicked()
                         {
                             if let Err(err) = firewall::relaunch_as_admin() {
@@ -1055,12 +1066,12 @@ impl eframe::App for App {
                                             toggle_action = Some(idx);
                                         }
 
-                                        if let Some((ping_text, ping_color)) =
-                                            self.ping_status_for_server(&server.code)
+                                        if let Some((rule_text, rule_color)) =
+                                            self.rule_status_for_server(&server.code)
                                         {
                                             ui.label(
-                                                RichText::new(ping_text)
-                                                    .color(ping_color)
+                                                RichText::new(rule_text)
+                                                    .color(rule_color)
                                                     .small()
                                                     .monospace(),
                                             );
@@ -1088,57 +1099,51 @@ impl eframe::App for App {
                     ui.separator();
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new("Rule Verification (Ping)")
+                        RichText::new("Firewall Rule Verification")
                             .color(Color32::WHITE)
                             .small(),
                     );
                     ui.label(
                         RichText::new(
-                            "Verifies listed servers with ping. PASS/FAIL is based on expected blocked state.",
+                            "Reads Windows Firewall rules and compares them with the app state.",
                         )
                         .color(TEXT_DIM)
                         .small(),
                     );
-                    ui.label(
-                        RichText::new("Note: some servers may block ICMP ping.")
-                            .color(TEXT_DIM)
-                            .small(),
-                    );
-
-                    let mut verify_ping = false;
-                    let mut clear_ping = false;
+                    let mut verify_rules = false;
+                    let mut clear_rules = false;
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
-                                self.ping_rx.is_none(),
-                                egui::Button::new("Verify Listed by Ping"),
+                                self.rule_rx.is_none(),
+                                egui::Button::new("Verify Listed Rules"),
                             )
                             .clicked()
                         {
-                            verify_ping = true;
+                            verify_rules = true;
                         }
 
                         if ui
                             .add_enabled(
-                                self.ping_rx.is_none(),
-                                egui::Button::new("Clear Ping Results"),
+                                self.rule_rx.is_none(),
+                                egui::Button::new("Clear Rule Results"),
                             )
                             .clicked()
                         {
-                            clear_ping = true;
+                            clear_rules = true;
                         }
                     });
-                    if verify_ping {
-                        self.start_ping_verification(listed_indices, ctx);
-                    } else if clear_ping {
+                    if verify_rules {
+                        self.start_rule_verification(listed_indices, ctx);
+                    } else if clear_rules {
                         for idx in listed_indices {
                             if let Some(server) = self.servers.get(idx) {
-                                self.ping_results.remove(&server.code);
+                                self.rule_results.remove(&server.code);
                             }
                         }
                     }
 
-                    self.show_ping_running_indicator(ui);
+                    self.show_rule_running_indicator(ui);
                 }
 
                 ui.add_space(8.0);
@@ -1201,8 +1206,8 @@ impl eframe::App for App {
                     });
                 });
                 ui.add_space(4.0);
-                if self.ping_rx.is_some() {
-                    self.show_ping_running_indicator(ui);
+                if self.rule_rx.is_some() {
+                    self.show_rule_running_indicator(ui);
                     ui.add_space(4.0);
                 }
 
@@ -1231,10 +1236,10 @@ impl eframe::App for App {
                     });
                 }
 
-                let ping_enabled = self.ping_rx.is_none();
+                let rule_enabled = self.rule_rx.is_none();
                 let mut selected = std::mem::take(&mut self.selected_countries);
                 let mut except_sels = std::mem::take(&mut self.except_selections);
-                ui.add_enabled_ui(!action_running, |ui| {
+                ui.add_enabled_ui(!action_running && !self.blocked_sync_in_progress, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("countries_side_scroll")
                         .show(ui, |ui| {
@@ -1281,11 +1286,22 @@ impl eframe::App for App {
                                             }
                                         }
                                     }
-                                    ui.label(
-                                        RichText::new(continent_header)
-                                            .color(continent_color)
-                                            .strong(),
-                                    );
+                                    let continent_should_block =
+                                        !(continent_blocked == continent_total && continent_total > 0);
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(continent_header)
+                                                    .color(continent_color)
+                                                    .strong(),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .clicked()
+                                    {
+                                        continent_action =
+                                            Some((continent.to_string(), continent_should_block));
+                                    }
                                 });
                                 ui.add_space(2.0);
                                 for (country, total, blocked_servers) in countries {
@@ -1301,7 +1317,7 @@ impl eframe::App for App {
                                     let has_multiple = *total > 1;
                                     let is_expanded = self.expanded_countries.contains(country);
                                     let row_text = format!("{} ({}/{})", country, blocked_servers, total);
-                                    let ps = self.country_ping_summary(country);
+                                    let rule_summary = self.country_rule_summary(country);
                                     let should_block = !all_blocked;
                                     ui.horizontal(|ui| {
                                         ui.add_space(16.0);
@@ -1317,15 +1333,17 @@ impl eframe::App for App {
                                         }
                                         self.render_country_row(
                                             ui,
-                                            country,
-                                            row_text,
-                                            row_color,
-                                            should_block,
+                                            CountryRow {
+                                                country,
+                                                row_text,
+                                                row_color,
+                                                should_block,
+                                                rule_summary,
+                                                rule_enabled,
+                                            },
                                             &mut country_action,
-                                            &mut country_ping_action,
+                                            &mut country_rule_action,
                                             &mut selected,
-                                            ps,
-                                            ping_enabled,
                                         );
                                     });
                                     // Show individual servers when expanded
@@ -1338,7 +1356,7 @@ impl eframe::App for App {
                                             let srv_color = if srv_blocked { RED } else { GREEN };
                                             let srv_status = if srv_blocked { "blocked" } else { "active" };
                                             let srv_text = format!("{} [{}]", server.desc, srv_status);
-                                            let ps = self.ping_status_for_server(&server.code);
+                                            let rules = self.rule_status_for_server(&server.code);
                                             ui.horizontal(|ui| {
                                                 ui.add_space(32.0);
                                                 ui.label(RichText::new(srv_text).color(srv_color).small());
@@ -1346,8 +1364,8 @@ impl eframe::App for App {
                                                 if ui.button(RichText::new(btn_label).small()).clicked() {
                                                     server_toggle_action = Some((server.code.clone(), !srv_blocked));
                                                 }
-                                                if let Some((ping_text, ping_color)) = ps {
-                                                    ui.label(RichText::new(ping_text).color(ping_color).small().monospace());
+                                                if let Some((rule_text, rule_color)) = rules {
+                                                    ui.label(RichText::new(rule_text).color(rule_color).small().monospace());
                                                 }
                                             });
                                         }
@@ -1444,12 +1462,7 @@ impl eframe::App for App {
                 );
 
                 let region_stats = self.region_stats();
-                map::draw_region_labels(
-                    &painter,
-                    map_rect,
-                    &self.map_state,
-                    &region_stats,
-                );
+                map::draw_region_labels(&painter, map_rect, &self.map_state, &region_stats);
 
                 // Tooltip on hover
                 if let Some(idx) = hovered {
@@ -1500,7 +1513,9 @@ impl eframe::App for App {
             });
 
         if unblock_all_action {
-            let target: Vec<_> = self.servers.iter()
+            let target: Vec<_> = self
+                .servers
+                .iter()
                 .filter(|s| self.blocked.contains(&s.code))
                 .cloned()
                 .collect();
@@ -1509,12 +1524,23 @@ impl eframe::App for App {
             }
         } else if let Some(should_block) = mass_block_action {
             let selected_set = &self.selected_countries;
-            let target: Vec<_> = self.servers.iter().enumerate().filter(|(idx, s)| {
-                let country = &self.server_countries[*idx];
-                if !selected_set.contains(country) { return false; }
-                if should_block { !self.blocked.contains(&s.code) }
-                else { self.blocked.contains(&s.code) }
-            }).map(|(_, s)| s.clone()).collect();
+            let target: Vec<_> = self
+                .servers
+                .iter()
+                .enumerate()
+                .filter(|(idx, s)| {
+                    let country = &self.server_countries[*idx];
+                    if !selected_set.contains(country) {
+                        return false;
+                    }
+                    if should_block {
+                        !self.blocked.contains(&s.code)
+                    } else {
+                        self.blocked.contains(&s.code)
+                    }
+                })
+                .map(|(_, s)| s.clone())
+                .collect();
             if !target.is_empty() {
                 let label = format!("{} selected countries", selected_set.len());
                 self.start_block_state_for_servers(label, should_block, target, ctx);
@@ -1533,7 +1559,10 @@ impl eframe::App for App {
                 }
             }
             // Block all non-excepted unblocked servers
-            let to_block: Vec<_> = self.servers.iter().enumerate()
+            let to_block: Vec<_> = self
+                .servers
+                .iter()
+                .enumerate()
                 .filter(|(idx, s)| {
                     let country = &self.server_countries[*idx];
                     countries_to_block.contains(country) && !self.blocked.contains(&s.code)
@@ -1541,7 +1570,10 @@ impl eframe::App for App {
                 .map(|(_, s)| s.clone())
                 .collect();
             // Unblock the excepted country's servers if they are blocked
-            let to_unblock: Vec<_> = self.servers.iter().enumerate()
+            let to_unblock: Vec<_> = self
+                .servers
+                .iter()
+                .enumerate()
                 .filter(|(idx, s)| {
                     let country = &self.server_countries[*idx];
                     country == &except_country
@@ -1558,9 +1590,9 @@ impl eframe::App for App {
             self.start_country_block_state(&country, should_block, ctx);
         }
 
-        if let Some(country) = country_ping_action {
+        if let Some(country) = country_rule_action {
             let indices = self.server_indices_for_country(&country);
-            self.start_ping_verification(indices, ctx);
+            self.start_rule_verification(indices, ctx);
         }
 
         if let Some(idx) = toggle_action {
@@ -1578,12 +1610,17 @@ impl eframe::App for App {
 
         // Full-screen loading overlay
         if self.loading {
-            let screen_rect = ctx.screen_rect();
-            let overlay_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("loading_overlay"));
+            let content_rect = ctx.screen_rect();
+            let overlay_layer =
+                egui::LayerId::new(egui::Order::Foreground, egui::Id::new("loading_overlay"));
             let painter = ctx.layer_painter(overlay_layer);
 
             // Semi-transparent dark background
-            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+            painter.rect_filled(
+                content_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+            );
 
             // Centered area for spinner + text
             egui::Area::new(egui::Id::new("loading_area"))
@@ -1603,25 +1640,6 @@ impl eframe::App for App {
                 });
         }
     }
-}
-
-fn ping_host_once(ip: &str) -> bool {
-    #[cfg(windows)]
-    let args = ["-n", "1", "-w", "700", ip];
-
-    #[cfg(not(windows))]
-    let args = ["-c", "1", "-W", "1", ip];
-
-    let mut cmd = std::process::Command::new("ping");
-    cmd.args(args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    cmd.output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -1647,15 +1665,15 @@ fn infer_country(desc: &str) -> String {
         return normalize_country_name(&country);
     }
 
-    if let Some(part) = trimmed.split(',').next_back() {
-        let p = part.trim();
+    if let Some((_, country)) = trimmed.rsplit_once(',') {
+        let p = country.trim();
         if !p.is_empty() {
             return normalize_country_name(p);
         }
     }
 
-    if let Some(part) = trimmed.split('-').next_back() {
-        let p = part.trim();
+    if let Some((_, country)) = trimmed.rsplit_once('-') {
+        let p = country.trim();
         if !p.is_empty() && p.len() <= 24 {
             return normalize_country_name(p);
         }
@@ -1688,6 +1706,10 @@ fn normalize_country_name(raw: &str) -> String {
         .join(" ");
     let lower = cleaned.to_lowercase();
 
+    if is_us_state_name(&lower) {
+        return "United States".to_string();
+    }
+
     match lower.as_str() {
         "us" | "u.s" | "u.s." | "usa" | "united states" | "united states of america" => {
             return "United States".to_string();
@@ -1717,6 +1739,62 @@ fn normalize_country_name(raw: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn is_us_state_name(lower: &str) -> bool {
+    matches!(
+        lower,
+        "alabama"
+            | "alaska"
+            | "arizona"
+            | "arkansas"
+            | "california"
+            | "colorado"
+            | "connecticut"
+            | "delaware"
+            | "florida"
+            | "georgia"
+            | "hawaii"
+            | "idaho"
+            | "illinois"
+            | "indiana"
+            | "iowa"
+            | "kansas"
+            | "kentucky"
+            | "louisiana"
+            | "maine"
+            | "maryland"
+            | "massachusetts"
+            | "michigan"
+            | "minnesota"
+            | "mississippi"
+            | "missouri"
+            | "montana"
+            | "nebraska"
+            | "nevada"
+            | "new hampshire"
+            | "new jersey"
+            | "new mexico"
+            | "new york"
+            | "north carolina"
+            | "north dakota"
+            | "ohio"
+            | "oklahoma"
+            | "oregon"
+            | "pennsylvania"
+            | "rhode island"
+            | "south carolina"
+            | "south dakota"
+            | "tennessee"
+            | "texas"
+            | "utah"
+            | "vermont"
+            | "virginia"
+            | "washington"
+            | "west virginia"
+            | "wisconsin"
+            | "wyoming"
+    )
 }
 
 fn continent_for_country(country: &str) -> &'static str {
@@ -1755,8 +1833,7 @@ fn continent_for_country(country: &str) -> &'static str {
         | "philippines" => {
             return "Asia";
         }
-        "united states" | "canada" | "mexico" | "california" | "illinois" | "texas"
-        | "virginia" | "washington" | "oregon" | "florida" | "new york" | "georgia" => {
+        "united states" | "canada" | "mexico" => {
             return "North America";
         }
         _ => {}
@@ -1773,14 +1850,38 @@ fn continent_for_country(country: &str) -> &'static str {
         return "Asia";
     }
 
-    if lower.contains("united states")
-        || lower.contains("canada")
-        || lower.contains("mexico")
-        || lower.contains("california")
-        || lower.contains("illinois")
-    {
+    if lower.contains("united states") || lower.contains("canada") || lower.contains("mexico") {
         return "North America";
     }
 
     "Unknown"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infers_us_states_as_united_states() {
+        assert_eq!(infer_country("Atlanta (Georgia)"), "United States");
+        assert_eq!(infer_country("Seattle - Washington"), "United States");
+        assert_eq!(infer_country("Los Angeles, California"), "United States");
+        assert_eq!(infer_country("US"), "United States");
+    }
+
+    #[test]
+    fn infers_common_country_aliases() {
+        assert_eq!(infer_country("London (UK)"), "United Kingdom");
+        assert_eq!(infer_country("Dubai, UAE"), "United Arab Emirates");
+        assert_eq!(infer_country("Stockholm - Sweden"), "Sweden");
+    }
+
+    #[test]
+    fn places_normalized_us_in_north_america() {
+        assert_eq!(continent_for_country("United States"), "North America");
+        assert_eq!(
+            continent_for_country(&infer_country("Chicago (Illinois)")),
+            "North America"
+        );
+    }
 }
